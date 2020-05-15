@@ -24,6 +24,31 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 
+type MapTask struct {
+	TaskNum  int    `json:"task_num"`
+	FileName string `json:"file_name"`
+	Exit     bool   `json:"exist"`
+}
+
+type IntermediateInfo struct {
+	MapTask
+	IntermediateFile []string
+}
+
+type ReduceTask struct {
+	TaskNum           int `json:"task_num"`
+	IntermediateFiles []string
+	Exist             bool `json:"exist"`
+}
+
+type ReduceTaskDoneInfo struct {
+	TaskNum    int    `json:"task_num"`
+	OutputFile string `json:"output_file"`
+}
+
+type JobInfo struct {
+	NReduce int `json:"n_reduce"`
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the master.
