@@ -77,7 +77,7 @@ func (l *LogEntries) Get(i LogIndex) Log {
 	if i < 0 {
 		return Log{
 			Term:  0,
-			Index: -1,
+			Index: 0,
 		}
 	}
 	return l.Entries[i]
@@ -496,7 +496,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
-	DPrintf("%s receive AppendEntries from %d leader", debugPrefix, args.LeaderID)
 	// logMatching property means we can safety drop any log entries after prevLogIndex
 	if args.PrevLogIndex+1 < logsLastIndex(rf.Logs) {
 		deleted := rf.Logs.TruncateLogs(0, args.PrevLogIndex+1)
@@ -557,7 +556,7 @@ func (rf *Raft) convertToLeader() {
 		rf.leaderSpecState.matchIndex[i] = -1
 	}
 	DPrintf("%s begin convert to leader, current term: %d, nextIndex initial to %d, matchIndex all initial to %d",
-		debugPrefix, rf.currentTerm, length, 0)
+		debugPrefix, rf.currentTerm, length, -1)
 
 	go func() {
 		for {
@@ -622,16 +621,16 @@ func (rf *Raft) convertToLeader() {
 							rf.leaderSpecState.matchIndex[i] = newNextIndex - 1
 							rf.leaderSpecState.nextIndex[i] = newNextIndex
 							commitIndex := rf.leaderSpecState.MaxMajorityIndex()
-							DPrintf("%s matchIndex: %v, nextIndex: %v, commitIndex: %d",
-								debugPrefix, rf.leaderSpecState.matchIndex, rf.leaderSpecState.nextIndex, commitIndex)
 							DPrintf("%s set %d peer nextIndex to %d and matchIndex to %d",
 								debugPrefix, i, rf.leaderSpecState.nextIndex[i], rf.leaderSpecState.matchIndex[i])
+							DPrintf("%s matchIndex: %v, nextIndex: %v, commitIndex: %d",
+								debugPrefix, rf.leaderSpecState.matchIndex, rf.leaderSpecState.nextIndex, commitIndex)
 							// commit log up to commitIndex if commitIndex > rf.commitIndex and
 							// commitIndex logEntry's term is equal to rf.currentTerm
-							if commitIndex > rf.commitIndex {
-								DPrintf("%s trying to commit log up to %d", debugPrefix, commitIndex)
+							if commitIndex > rf.lastApplied {
 								commitLog := rf.Logs.Get(commitIndex)
 								if commitLog.Term == rf.currentTerm {
+									DPrintf("%s trying to commit log up to %d", debugPrefix, commitIndex)
 									rf.commitIndex = commitIndex
 									rf.commitLogCond.Signal()
 									return
@@ -643,6 +642,7 @@ func (rf *Raft) convertToLeader() {
 							rf.leaderSpecState.nextIndex[i]--
 							DPrintf("%s %d peer log not match, set nextIndex to %d", debugPrefix, i, rf.leaderSpecState.nextIndex[i])
 						}
+						return
 					}
 					DPrintf("%s sendAppendEntries to %d peer timeout", debugPrefix, i)
 				}(i)
@@ -707,7 +707,7 @@ func (rf *Raft) commitLogEntries() {
 		defer rf.commitLogCond.L.Unlock()
 		for {
 			if rf.killed() {
-				DPrintf("%s raft is killed, exist commitLogEntries goroutine", debugPrefix)
+				DPrintf("%s raft is killed, exist", debugPrefix)
 				return
 			}
 			if rf.commitIndex > rf.lastApplied {
@@ -743,13 +743,30 @@ func (rf *Raft) commitLogEntries() {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	var index LogIndex = -1
+	var term Term = 0
 
 	// Your code here (2B).
-
-	return index, term, isLeader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	debugPrefix := logPrefix("Start", rf.me)
+	if rf.status != leader {
+		DPrintf("%s not a leader, refuse receive command", debugPrefix)
+		return int(index), int(term), false
+	}
+	lastIndex, _ := rf.Logs.LastIndexAndTerm()
+	index = lastIndex + 2
+	term = rf.currentTerm
+	log := Log{
+		Term:    term,
+		Index:   index,
+		Command: command,
+	}
+	rf.Logs.Append(log)
+	rf.nextIndex[rf.me] = lastIndex + 1
+	rf.matchIndex[rf.me] = lastIndex + 1
+	DPrintf("%s append log at %d index, term: %d", debugPrefix, lastIndex+1, log.Term)
+	return int(index), int(term), true
 }
 
 //
@@ -805,6 +822,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// kick off leader election periodically
 	rf.leaderElectionPeriodicCheck()
+	rf.commitLogEntries()
 	return rf
 }
 
