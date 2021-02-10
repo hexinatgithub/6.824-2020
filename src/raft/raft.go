@@ -18,12 +18,15 @@ package raft
 //
 
 import (
+	"bytes"
 	"fmt"
 	"math/rand"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"../labgob"
 	"../labrpc"
 )
 
@@ -169,15 +172,15 @@ type leaderSpecState struct {
 func (s *leaderSpecState) MaxMajorityIndex() LogIndex {
 	counts := make(map[LogIndex]int)
 	totalPeers := len(s.matchIndex)
-	for i := totalPeers - 1; i >= 0; i-- {
+	for i := 0; i < totalPeers; i++ {
 		matchIndex := s.matchIndex[i]
 		counts[matchIndex] = counts[matchIndex] + 1
 	}
 
-	var max LogIndex = -1
-	for ki, c := range counts {
-		if getQuorum(totalPeers, c) && ki > max {
-			max = ki
+	var max LogIndex = 0
+	for li, c := range counts {
+		if getQuorum(totalPeers, c) && li > max {
+			max = li
 		}
 	}
 	return max
@@ -264,6 +267,24 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	debugPrefix := logPrefix("persist", rf.me)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if e.Encode(rf.currentTerm) != nil ||
+		e.Encode(voteToString(rf.voteFor)) != nil ||
+		e.Encode(rf.Logs) != nil {
+		DPrintf("%s persist raft state error", debugPrefix)
+		return
+	}
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+}
+
+func voteToString(vote *int) string {
+	if vote == nil {
+		return "None"
+	}
+	return fmt.Sprintf("%d", *vote)
 }
 
 //
@@ -286,6 +307,30 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	debugPrefix := logPrefix("readPersist", rf.me)
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm Term
+	var voteFor string
+	var logs LogEntries
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&voteFor) != nil ||
+		d.Decode(&logs) != nil {
+		DPrintf("%s read persist data error", debugPrefix)
+		return
+	}
+	rf.currentTerm = currentTerm
+	rf.voteFor = stringToVote(voteFor)
+	rf.Logs = logs
+}
+
+func stringToVote(vote string) *int {
+	if vote == "None" {
+		return nil
+	}
+	v, err := strconv.Atoi(vote)
+	DPrintf("%s convert vote string to int error: %s", "stringToVote", err)
+	return &v
 }
 
 //
@@ -332,11 +377,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		return
 	}
-	rf.convertToFollower(args.Term)
+	changed := rf.convertToFollower(args.Term)
+	defer func() {
+		if changed {
+			rf.persist()
+		}
+	}()
 	if !rf.voted() && rf.atLeastUpToDate(args.LastLogIndex, args.LastLogTerm) {
 		DPrintf("%s candidate log is at least up to date with me, grant vote for %d, current status: %s, current term: %d, candidate term: %d",
 			debugPrefix, args.Candidate, rf.status, rf.currentTerm, args.Term)
 		rf.vote(args.Candidate)
+		changed = true
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
 		return
@@ -404,6 +455,7 @@ func (rf *Raft) leaderElectionPeriodicCheck() {
 		if rf.leaderHeartBeatRecorder.Elapsed(duration) {
 			rf.vote(rf.me)
 			rf.currentTerm++
+			rf.persist()
 			rf.status = candidate
 			rf.leaderSpecState = nil
 			count := 1
@@ -440,7 +492,9 @@ func (rf *Raft) leaderElectionPeriodicCheck() {
 						if reply.Term > rf.currentTerm {
 							DPrintf("%s reply from %d peer term is more update to date, current term: %d, reply term: %d",
 								debugPrefix, i, rf.currentTerm, reply.Term)
-							rf.convertToFollower(reply.Term)
+							if rf.convertToFollower(reply.Term) {
+								rf.persist()
+							}
 							return
 						}
 
@@ -517,7 +571,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
-	rf.convertToFollowerAndRecordHeartBeat(args.Term, true)
+	changed := rf.convertToFollowerAndRecordHeartBeat(args.Term, true)
+	defer func() {
+		if changed {
+			rf.persist()
+		}
+	}()
 	DPrintf("%s receive heartbeat from %d at time [%s]", debugPrefix, args.LeaderID, rf.leaderHeartBeatRecorder.time)
 	if !rf.logMatch(args.PrevLogIndex, args.PrevLogTerm) {
 		DPrintf("%s log not matched, refuse append log entries", debugPrefix)
@@ -532,8 +591,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		deleted := rf.Logs.TruncateLogs(1, args.PrevLogIndex+1)
 		DPrintf("%s truncate raft log entries [%d:%d), %d log entries deleted",
 			debugPrefix, 1, args.PrevLogIndex+1, deleted)
+		changed = changed || deleted > 0
 	}
 	rf.Logs.Append(args.Entries...)
+	changed = changed || len(args.Entries) > 0
 	if args.LeaderCommit > rf.commitIndex {
 		lastIndex, _ = rf.Logs.LastIndexAndTerm()
 		rf.commitIndex = minLogIndex(args.LeaderCommit, lastIndex)
@@ -550,26 +611,29 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
-func (rf *Raft) convertToFollower(leaderTerm Term) {
+func (rf *Raft) convertToFollower(leaderTerm Term) bool {
 	debugPrefix := logPrefix("convertToFollower", rf.me)
 	DPrintf("%s begin convert to follower status, current status: %s, candidate or leader term: %d",
 		debugPrefix, rf.status, leaderTerm)
-	rf.convertToFollowerAndRecordHeartBeat(leaderTerm, false)
+	return rf.convertToFollowerAndRecordHeartBeat(leaderTerm, false)
 }
 
-func (rf *Raft) convertToFollowerAndRecordHeartBeat(term Term, record bool) {
+func (rf *Raft) convertToFollowerAndRecordHeartBeat(term Term, record bool) (changed bool) {
 	debugPrefix := logPrefix("convertToFollowerAndRecordHeartBeat", rf.me)
 	if rf.currentTerm != term && rf.voted() {
 		DPrintf("%s reset vote for new term: %d, current term is %d, voted for: %s",
 			debugPrefix, term, rf.currentTerm, rf.getVote())
 		rf.resetVote()
+		changed = true
 	}
 	if record {
 		rf.leaderHeartBeatRecorder.Record()
 	}
+	changed = changed || rf.currentTerm != term
 	rf.currentTerm = term
 	rf.status = follower
 	rf.leaderSpecState = nil
+	return
 }
 
 // must hold rf.mu and status must be candidate
@@ -722,7 +786,9 @@ func (rf *Raft) sendHeartBeatPeriodIfIsLeader() {
 						if reply.Term > rf.currentTerm {
 							DPrintf("%s %d peer reply is more update to date, current term: %d, reply term: %d",
 								debugPrefix, i, rf.currentTerm, reply.Term)
-							rf.convertToFollower(reply.Term)
+							if rf.convertToFollower(reply.Term) {
+								rf.persist()
+							}
 							return
 						}
 						if reply.Success {
@@ -736,7 +802,7 @@ func (rf *Raft) sendHeartBeatPeriodIfIsLeader() {
 								debugPrefix, rf.leaderSpecState.matchIndex, rf.leaderSpecState.nextIndex, commitIndex)
 							// commit log up to commitIndex if commitIndex > rf.commitIndex and
 							// commitIndex logEntry's term is equal to rf.currentTerm
-							if commitIndex > rf.lastApplied && commitIndex >= rf.commitIndex {
+							if commitIndex > rf.lastApplied {
 								commitLog := rf.Logs.Get(commitIndex)
 								if commitLog.Term == rf.currentTerm {
 									DPrintf("%s trying to commit log up to %d", debugPrefix, commitIndex)
@@ -806,6 +872,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 	}
 	rf.Logs.Append(log)
+	rf.persist()
 	rf.nextIndex[rf.me] = index + 1
 	rf.matchIndex[rf.me] = index
 	DPrintf("%s append log at %d index, term: %d", debugPrefix, log.Index, log.Term)
@@ -830,6 +897,7 @@ func (rf *Raft) Kill() {
 	defer rf.mu.Unlock()
 	rf.commitLogCond.Signal()
 	rf.isLeaderCond.Signal()
+	rf.persist()
 }
 
 func (rf *Raft) killed() bool {
