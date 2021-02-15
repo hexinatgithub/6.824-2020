@@ -92,7 +92,7 @@ func (l *LogEntries) Get(i LogIndex) Log {
 
 func (l *LogEntries) TermFirst(i LogIndex) (LogIndex, Term) {
 	log := l.Get(i)
-	for j := i; j > 0; j-- {
+	for j := i - 1; j > 0; j-- {
 		tmp := l.Get(j)
 		if tmp.Term != log.Term {
 			break
@@ -145,9 +145,6 @@ func (l *LogEntries) TruncateLogs(start, end LogIndex) int {
 	}
 
 	newLength := truncateLength(si, ei)
-	if newLength == 0 {
-		return 0
-	}
 	// avoid memory leak
 	if si > 0 {
 		tmp := l.Entries[si:ei]
@@ -159,7 +156,7 @@ func (l *LogEntries) TruncateLogs(start, end LogIndex) int {
 	return length - newLength
 }
 
-func (l *LogEntries) TermLastEntry(firstIndex LogIndex) LogIndex {
+func (l *LogEntries) TermLast(firstIndex LogIndex) (LogIndex, Term) {
 	lastLog := l.Get(firstIndex)
 	length := l.Length()
 	for i := firstIndex + 1; i <= LogIndex(length); i++ {
@@ -169,7 +166,7 @@ func (l *LogEntries) TermLastEntry(firstIndex LogIndex) LogIndex {
 		}
 		lastLog = tmp
 	}
-	return lastLog.Index
+	return lastLog.Index, lastLog.Term
 }
 
 func truncateLength(start, end int) int {
@@ -420,7 +417,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = false
 		return
 	}
-	if !rf.voted() && rf.atLeastUpToDate(args.LastLogIndex, args.LastLogTerm) { // && args.Term == rf.currentTerm
+	if rf.atLeastUpToDate(args.LastLogIndex, args.LastLogTerm) { // && !rf.voted() && args.Term == rf.currentTerm
 		DPrintf("%s candidate log is at least up to date with me, grant vote for %d, current status: %s, current term: %d, candidate term: %d",
 			debugPrefix, args.Candidate, rf.status, rf.currentTerm, args.Term)
 		rf.vote(args.Candidate)
@@ -595,14 +592,19 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    Term
 	Success bool
-	LogRollBack
+	RollBack
 }
 
-type LogRollBack struct {
+type RollBack struct {
 	XTerm  Term
 	XIndex LogIndex
 	XLen   int
 }
+
+const (
+	RollBackLogShort LogIndex = -1
+	RollBackNoTerm   Term     = -1
+)
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
@@ -626,7 +628,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		DPrintf("%s log not matched, refuse append log entries", debugPrefix)
 		reply.Term = rf.currentTerm
 		reply.Success = false
-		reply.LogRollBack = rollBack
+		reply.RollBack = rollBack
 		return
 	}
 	lastIndex, _ := rf.Logs.LastIndexAndTerm()
@@ -701,19 +703,15 @@ func (rf *Raft) convertToLeader() {
 		debugPrefix, rf.currentTerm, nextIndex, 0)
 }
 
-func (rf *Raft) logMatch(prevLogIndex LogIndex, prevLogTerm Term) (rollBack LogRollBack, matched bool) {
+func (rf *Raft) logMatch(prevLogIndex LogIndex, prevLogTerm Term) (rollBack RollBack, matched bool) {
 	debugPrefix := logPrefix("logMatch", rf.me)
-	defer func() {
-		if err := recover(); err != nil {
-			DPrintf("%s prevLogIndex: %d, prevLogTerm: %d, current raft logs length: %d, error: %s",
-				debugPrefix, prevLogIndex, prevLogTerm, rf.Logs.Length(), err)
-		}
-	}()
 	lastIndex, _ := rf.Logs.LastIndexAndTerm()
 	if lastIndex < prevLogIndex {
-		DPrintf("%s log not match, raft logs length is less than leader, current logs length %d, prevLogIndex: %d, prevLogTerm: %d",
-			debugPrefix, rf.Logs.Length(), prevLogIndex, prevLogTerm)
+		DPrintf("%s log not match, raft logs length is less than leader, last log index: %d, prevLogIndex: %d, prevLogTerm: %d",
+			debugPrefix, lastIndex, prevLogIndex, prevLogTerm)
 		rollBack.XLen = rf.Logs.Length()
+		rollBack.XIndex = RollBackLogShort
+		rollBack.XTerm = RollBackNoTerm
 		return
 	}
 	log := rf.Logs.Get(prevLogIndex)
@@ -856,8 +854,9 @@ func (rf *Raft) sendHeartBeatPeriodIfIsLeader() {
 									debugPrefix, commitIndex, commitLog.Term, rf.currentTerm)
 							}
 						} else {
-							rf.leaderSpecState.nextIndex[i]--
-							DPrintf("%s %d peer log not match, set nextIndex to %d", debugPrefix, i, rf.leaderSpecState.nextIndex[i])
+							rf.quickRollBack(i, reply.RollBack)
+							DPrintf("%s %d peer log not match, set nextIndex to %d", debugPrefix,
+								i, rf.leaderSpecState.nextIndex[i])
 						}
 						return
 					}
@@ -879,19 +878,32 @@ func (rf *Raft) sendHeartBeatPeriodIfIsLeader() {
 	}()
 }
 
-func (rf *Raft) rollBackTo(rollBack LogRollBack) (nextIndex LogIndex) {
-	length := rf.Logs.Length()
-	if rollBack.XLen < length {
-		nextIndex = LogIndex(rollBack.XLen + 1)
+func (rf *Raft) quickRollBack(i int, rollBack RollBack) {
+	debugPrefix := logPrefix("quickRollBack", rf.me)
+	// case 1: follower's log is too short
+	if rollBack.XIndex == RollBackLogShort {
+		rf.leaderSpecState.nextIndex[i] = maxLogIndex(LogIndex(rollBack.XLen+1), 1)
+		DPrintf("%s follower log is too short, %d peer nextIndex quick rollback to %d, follower log length: %d, leader log length: %d",
+			debugPrefix, i, rf.leaderSpecState.nextIndex[i], rollBack.XLen, rf.Logs.Length())
 		return
 	}
-	//log := rf.Logs.Get(rollBack.XIndex)
-	//if log.Term != rollBack.XTerm {
-	//	nextIndex = rollBack.XIndex
-	//	return
-	//}
-	//nextIndex = rf.Logs.TermLastEntry(rollBack.XIndex) + 1
-	nextIndex = -1
+	// case 2: leader doesn't have XTerm
+	// follower first log entry index for that term must equal on all servers because
+	// there will be only one leader for that term
+	log := rf.Logs.Get(rollBack.XIndex)
+	if log.Term != rollBack.XTerm {
+		DPrintf("%s leader doesn't have %d term, %d follower first index for that term: {Index: %d, Term: %d}", debugPrefix,
+			rollBack.XTerm, i, rollBack.XIndex, rollBack.XTerm)
+		rf.leaderSpecState.nextIndex[i] = maxLogIndex(rollBack.XIndex, 1)
+		DPrintf("%s leader log at %d index is %d term, nextIndex quick rollback to %d", debugPrefix,
+			rollBack.XIndex, log.Term, rf.leaderSpecState.nextIndex[i])
+		return
+	}
+	// case 3: leader has XTerm
+	termLastIndex, _ := rf.Logs.TermLast(rollBack.XIndex)
+	rf.leaderSpecState.nextIndex[i] = maxLogIndex(termLastIndex+1, 1)
+	DPrintf("%s leader log at %d index is equal to %d follower %d term, nextIndex quick rollback to %d", debugPrefix,
+		rollBack.XIndex, i, rollBack.XTerm, rf.leaderSpecState.nextIndex[i])
 	return
 }
 
@@ -1005,6 +1017,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 func minLogIndex(a, b LogIndex) LogIndex {
 	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxLogIndex(a, b LogIndex) LogIndex {
+	if a > b {
 		return a
 	}
 	return b
